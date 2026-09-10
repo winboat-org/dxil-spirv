@@ -317,9 +317,25 @@ bool emit_coverage_instruction(Converter::Impl &impl, const llvm::CallInst *inst
 	ptr_op->add_id(builder.makeUintConstant(0));
 	impl.add(ptr_op);
 
-	Operation *load_op = impl.allocate(spv::OpLoad, instruction);
+	Operation *load_op = impl.options.helios_forced_sample_count_one ?
+	                     impl.allocate(spv::OpLoad, builder.makeUintType(32)) :
+	                     impl.allocate(spv::OpLoad, instruction);
 	load_op->add_id(ptr_op->id);
 	impl.add(load_op);
+	if (impl.options.helios_forced_sample_count_one)
+	{
+		// Every Vulkan coverage sample is at the same pixel center. Preserve
+		// zero for helper pixels, but expose exactly one D3D raster sample.
+		auto *covered = impl.allocate(spv::OpINotEqual, builder.makeBoolType());
+		covered->add_id(load_op->id);
+		covered->add_id(builder.makeUintConstant(0));
+		impl.add(covered);
+		auto *mask = impl.allocate(spv::OpSelect, instruction);
+		mask->add_id(covered->id);
+		mask->add_id(builder.makeUintConstant(1));
+		mask->add_id(builder.makeUintConstant(0));
+		impl.add(mask);
+	}
 	return true;
 }
 

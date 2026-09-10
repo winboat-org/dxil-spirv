@@ -261,6 +261,21 @@ struct Remapper : ResourceRemappingInterface
 		}
 	}
 
+	bool remap_stream_output_component(const D3DStreamOutputComponent &output, VulkanStreamOutput &vk_output) override
+	{
+		if (!component_output_remapper)
+			return true;
+		dxil_spv_d3d_stream_output_component c_output = {
+			output.semantic, output.semantic_index, output.register_index, output.component_index,
+			output.semantic_component, output.stream_index, output.capture_index };
+		dxil_spv_vulkan_stream_output_component c_vk_output = {};
+		if (component_output_remapper(component_output_userdata, &c_output, &c_vk_output) != DXIL_SPV_TRUE)
+			return false;
+		vk_output = { c_vk_output.offset, c_vk_output.stride, c_vk_output.buffer_index,
+			bool(c_vk_output.enable), c_vk_output.max_output_components, c_vk_output.max_total_output_components };
+		return true;
+	}
+
 	bool remap_stage_input(const D3DStageIO &d3d_input, VulkanStageIO &vk_input) override
 	{
 		dxil_spv_d3d_shader_stage_io c_input = { d3d_input.semantic, d3d_input.semantic_index };
@@ -339,6 +354,8 @@ struct Remapper : ResourceRemappingInterface
 
 	dxil_spv_stream_output_remapper_cb output_remapper = nullptr;
 	void *output_userdata = nullptr;
+	dxil_spv_stream_output_component_remapper_cb component_output_remapper = nullptr;
+	void *component_output_userdata = nullptr;
 
 	dxil_spv_shader_stage_io_remapper_cb stage_input_remapper = nullptr;
 	void *stage_input_userdata = nullptr;
@@ -933,6 +950,13 @@ void dxil_spv_converter_set_stream_output_remapper(dxil_spv_converter converter,
 	converter->remapper.output_userdata = userdata;
 }
 
+void dxil_spv_converter_set_stream_output_component_remapper(dxil_spv_converter converter,
+        dxil_spv_stream_output_component_remapper_cb remapper, void *userdata)
+{
+	converter->remapper.component_output_remapper = remapper;
+	converter->remapper.component_output_userdata = userdata;
+}
+
 /* Useful to check if the implementation recognizes a particular capability for ABI compatibility. */
 dxil_spv_bool dxil_spv_converter_supports_option(dxil_spv_option cap)
 {
@@ -985,6 +1009,21 @@ dxil_spv_result dxil_spv_converter_add_option(dxil_spv_converter converter, cons
 		const auto *count = reinterpret_cast<const dxil_spv_option_rasterizer_sample_count *>(option);
 		helper.count = count->sample_count;
 		helper.spec_constant = bool(count->spec_constant);
+		converter->options.emplace_back(duplicate(helper));
+		break;
+	}
+
+	case DXIL_SPV_OPTION_HELIOS_FORCED_SAMPLE_COUNT_ONE:
+	{
+		converter->options.emplace_back(new OptionHeliosForcedSampleCountOne());
+		break;
+	}
+
+	case DXIL_SPV_OPTION_HELIOS_TIR_SINGLE_SAMPLE_OUTPUT:
+	{
+		OptionHeliosTIRSingleSampleOutput helper;
+		const auto *tir = reinterpret_cast<const dxil_spv_option_helios_tir_single_sample_output *>(option);
+		helper.alpha_to_coverage = bool(tir->alpha_to_coverage);
 		converter->options.emplace_back(duplicate(helper));
 		break;
 	}

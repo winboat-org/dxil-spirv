@@ -241,7 +241,8 @@ struct Converter::Impl
 	                            Vector<ConvertedFunction::Function> &leaves);
 	spv::Id get_id_for_value(const llvm::Value *value, unsigned forced_integer_width = 0);
 	spv::Id get_id_for_constant(const llvm::Constant *constant, unsigned forced_width);
-	spv::Id get_padded_constant_array(spv::Id padded_type_id, const llvm::Constant *constant);
+	spv::Id get_constant_array(spv::Id type_id, const llvm::Constant *constant, bool padded, bool raw_float);
+	bool is_robust_constant_lut(const llvm::Value *value) const;
 	spv::Id get_id_for_undef(const llvm::UndefValue *undef);
 	spv::Id get_id_for_undef_constant(const llvm::UndefValue *undef);
 	void emit_patch_output_lowering(CFGNode *node);
@@ -585,6 +586,14 @@ struct Converter::Impl
 		unsigned row_stride;
 		spv::BuiltIn builtin;
 	};
+	struct StreamOutputCapture
+	{
+		unsigned element_id;
+		unsigned row;
+		unsigned column;
+		spv::Id variable_id;
+	};
+	Vector<StreamOutputCapture> stream_output_captures;
 	UnorderedMap<uint32_t, ElementMeta> input_elements_meta;
 	UnorderedMap<uint32_t, ElementMeta> output_elements_meta;
 	UnorderedMap<uint32_t, ElementPatchMeta> patch_elements_meta;
@@ -705,12 +714,16 @@ struct Converter::Impl
 	SizeAlignment get_physical_size_for_type(spv::Id type_id);
 
 	void set_option(const OptionBase &cap);
+	spv::Id helios_tir_alpha_mask_id = 0;
 	struct
 	{
 		bool shader_demote = false;
 		bool dual_source_blending = false;
 		unsigned rasterizer_sample_count = 0;
 		bool rasterizer_sample_count_spec_constant = true;
+		bool helios_forced_sample_count_one = false;
+		bool helios_tir_single_sample_output = false;
+		bool helios_tir_alpha_to_coverage = false;
 		Vector<unsigned> output_swizzles;
 		String shader_source_file;
 		String entry_point;

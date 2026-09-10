@@ -1300,7 +1300,7 @@ static spv::Id emit_cast_instruction_impl(Converter::Impl &impl, const Instructi
 			impl.add(op);
 			id = op->id;
 		}
-		else if (!llvm::isa<llvm::ConstantExpr>(instruction))
+		else if (!output_pointer_array_depth && !llvm::isa<llvm::ConstantExpr>(instruction))
 		{
 			// Shouldn't try to copy constant expressions.
 			// They are built on-demand either way, and we risk infinite recursion that way.
@@ -1312,6 +1312,8 @@ static spv::Id emit_cast_instruction_impl(Converter::Impl &impl, const Instructi
 		}
 
 		// Remember that we will need to bitcast on load or store to the real underlying type.
+		if (!llvm::isa<llvm::ConstantExpr>(instruction))
+			impl.rewrite_value(instruction, id);
 		impl.llvm_value_actual_type[instruction] = value_type;
 		impl.handle_to_storage_class[instruction] = storage;
 		return id;
@@ -1408,7 +1410,11 @@ static spv::Id build_constant_getelementptr(Converter::Impl &impl, const llvm::C
 	// If we're trying to getelementptr into a bitcasted pointer to array, we have to rewrite the pointer type.
 	type_id = resolve_llvm_actual_value_type(impl, cexpr, cexpr->getOperand(0), type_id);
 
-	auto storage = impl.get_effective_storage_class(cexpr->getOperand(0), builder.getStorageClass(ptr_id));
+	auto storage_itr = impl.handle_to_storage_class.find(cexpr->getOperand(0));
+	auto storage = storage_itr != impl.handle_to_storage_class.end() ? storage_itr->second : builder.getStorageClass(ptr_id);
+	impl.handle_to_storage_class[cexpr] = storage;
+	if (cexpr->getNumOperands() == 2 && cexpr->getOperand(1)->getUniqueInteger().getZExtValue() == 0)
+		return ptr_id;
 	type_id = builder.makePointer(storage, type_id);
 
 	Operation *op = impl.allocate(spv::OpAccessChain, type_id);
@@ -1432,7 +1438,16 @@ static spv::Id build_constant_getelementptr(Converter::Impl &impl, const llvm::C
 
 	unsigned num_operands = cexpr->getNumOperands();
 	for (uint32_t i = 2; i < num_operands; i++)
-		op->add_id(impl.get_id_for_value(cexpr->getOperand(i)));
+	{
+		if (i == 2 && impl.is_robust_constant_lut(cexpr->getOperand(0)))
+		{
+			auto *array_type = llvm::cast<llvm::ArrayType>(cexpr->getOperand(0)->getType()->getPointerElementType());
+			auto index = cexpr->getOperand(i)->getUniqueInteger().getZExtValue();
+			op->add_id(builder.makeUintConstant(std::min<uint64_t>(index, array_type->getArrayNumElements())));
+		}
+		else
+			op->add_id(impl.get_id_for_value(cexpr->getOperand(i)));
+	}
 
 	impl.add(op);
 	return op->id;
@@ -1573,7 +1588,7 @@ bool emit_getelementptr_instruction(Converter::Impl &impl, const llvm::GetElemen
 		type_id = impl.get_type_id(instruction->getType()->getPointerElementType());
 
 	// If we're trying to getelementptr into a bitcasted pointer to array, we have to rewrite the pointer type.
-	resolve_llvm_actual_value_type(impl, instruction, instruction->getOperand(0), type_id);
+	type_id = resolve_llvm_actual_value_type(impl, instruction, instruction->getOperand(0), type_id);
 
 	ags_getelementptr_filter(impl, instruction, type_id);
 
@@ -1581,7 +1596,10 @@ bool emit_getelementptr_instruction(Converter::Impl &impl, const llvm::GetElemen
 	if (DXIL::AddressSpace(instruction->getOperand(0)->getType()->getPointerAddressSpace()) == DXIL::AddressSpace::PhysicalNodeIO)
 		storage = spv::StorageClassPhysicalStorageBuffer;
 	else
-		storage = impl.get_effective_storage_class(instruction->getOperand(0), builder.getStorageClass(ptr_id));
+	{
+		auto itr = impl.handle_to_storage_class.find(instruction->getOperand(0));
+		storage = itr != impl.handle_to_storage_class.end() ? itr->second : builder.getStorageClass(ptr_id);
+	}
 
 	type_id = builder.makePointer(storage, type_id);
 
@@ -1606,8 +1624,37 @@ bool emit_getelementptr_instruction(Converter::Impl &impl, const llvm::GetElemen
 	}
 
 	unsigned num_operands = instruction->getNumOperands();
+	if (num_operands == 2)
+	{
+		// A zero-index GEP is an alias of the whole aggregate, not its scalar
+		// element type. Keep the actual padded array type and its bounds intact.
+		impl.rewrite_value(instruction, ptr_id);
+		impl.handle_to_storage_class[instruction] = storage;
+		return true;
+	}
 	for (uint32_t i = 2; i < num_operands; i++)
 	{
+		if (i == 2 && !elementptr_shift && impl.is_robust_constant_lut(instruction->getOperand(0)))
+		{
+			auto *array_type = llvm::cast<llvm::ArrayType>(instruction->getOperand(0)->getType()->getPointerElementType());
+			auto count = array_type->getArrayNumElements();
+			if (auto *constant = llvm::dyn_cast<llvm::ConstantInt>(instruction->getOperand(2)))
+				op->add_id(builder.makeUintConstant(std::min<uint64_t>(constant->getUniqueInteger().getZExtValue(), count)));
+			else
+			{
+				if (!impl.glsl_std450_ext)
+					impl.glsl_std450_ext = builder.import("GLSL.std.450");
+				auto *clamp_op = impl.allocate(spv::OpExtInst, builder.makeUintType(32));
+				clamp_op->add_id(impl.glsl_std450_ext);
+				clamp_op->add_id(GLSLstd450UMin);
+				clamp_op->add_id(impl.get_id_for_value(instruction->getOperand(2)));
+				clamp_op->add_id(builder.makeUintConstant(count));
+				impl.add(clamp_op);
+				op->add_id(clamp_op->id);
+			}
+			continue;
+		}
+
 		// Be a bit careful with the typing since we might have some weird bitcast pointer types flying around.
 		if (i == 2 && !llvm::isa<llvm::Constant>(instruction->getOperand(2)))
 		{
@@ -1619,24 +1666,7 @@ bool emit_getelementptr_instruction(Converter::Impl &impl, const llvm::GetElemen
 					if (address_space == DXIL::AddressSpace::GroupShared || address_space == DXIL::AddressSpace::Thread)
 					{
 						auto *global_var = llvm::dyn_cast<llvm::GlobalVariable>(instruction->getOperand(0));
-						if (global_var && global_var->hasInitializer() && global_var->isConstant() &&
-						    impl.options.extended_robustness.constant_lut &&
-						    !elementptr_shift && address_space == DXIL::AddressSpace::Thread)
-						{
-							// Robustness for constant LUTs.
-							if (!impl.glsl_std450_ext)
-								impl.glsl_std450_ext = builder.import("GLSL.std.450");
-
-							auto *clamp_op = impl.allocate(spv::OpExtInst, builder.makeUintType(32));
-							clamp_op->add_id(impl.glsl_std450_ext);
-							clamp_op->add_id(GLSLstd450UMin);
-							clamp_op->add_id(impl.get_id_for_value(instruction->getOperand(2)));
-							clamp_op->add_id(builder.makeUintConstant(array_type->getArrayNumElements()));
-							impl.add(clamp_op);
-							op->add_id(clamp_op->id);
-							continue;
-						}
-						else if (address_space == DXIL::AddressSpace::Thread && impl.options.extended_robustness.alloca)
+						if (address_space == DXIL::AddressSpace::Thread && impl.options.extended_robustness.alloca)
 						{
 							unsigned num_elements = array_type->getArrayNumElements();
 							auto *is_in_bounds = impl.allocate(spv::OpULessThan, builder.makeBoolType());
@@ -1754,6 +1784,7 @@ bool emit_load_instruction(Converter::Impl &impl, const llvm::LoadInst *instruct
 
 	auto addr_space = DXIL::AddressSpace(instruction->getPointerOperand()->getType()->getPointerAddressSpace());
 	bool non_private = addr_space != DXIL::AddressSpace::Thread &&
+	                   addr_space != DXIL::AddressSpace::ImmediateConstantBuffer &&
 	                   impl.execution_mode_meta.memory_model == spv::MemoryModelVulkan;
 
 	if (remapped_type_id != 0)

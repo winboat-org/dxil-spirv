@@ -424,6 +424,53 @@ bool emit_store_output_instruction(Converter::Impl &impl, const llvm::CallInst *
 	if (!get_constant_operand(instruction, 1, &output_element_index))
 		return false;
 
+	// Mirror scalar writes before raster-only fixups. Clip/cull distances use
+	// different native output storage but have the same DXIL StoreOutput inputs.
+	unsigned column;
+	if (!get_constant_operand(instruction, 3, &column))
+		return false;
+	for (const auto &capture : impl.stream_output_captures)
+	{
+		if (capture.element_id != output_element_index || capture.column != column)
+			continue;
+		unsigned row;
+		bool constant_row = get_constant_operand(instruction, 2, &row);
+		if (constant_row && capture.row != row)
+			continue;
+		auto scalar_type = builder.getDerefTypeId(capture.variable_id);
+		auto value = impl.get_id_for_value(instruction->getOperand(4));
+		auto source_type = impl.get_type_id(instruction->getOperand(4)->getType());
+		if (source_type != scalar_type)
+		{
+			spv::Op cast_op = spv::OpBitcast;
+			if (builder.getScalarTypeWidth(source_type) != 32)
+			{
+				cast_op = builder.isFloatType(scalar_type) ? spv::OpFConvert :
+					builder.isUintType(scalar_type) ? spv::OpUConvert : spv::OpSConvert;
+			}
+			auto *cast = impl.allocate(cast_op, scalar_type);
+			cast->add_id(value);
+			impl.add(cast);
+			value = cast->id;
+		}
+		if (!constant_row)
+		{
+			auto *equal = impl.allocate(spv::OpIEqual, builder.makeBoolType());
+			equal->add_ids({ impl.get_id_for_value(instruction->getOperand(2)), builder.makeUintConstant(capture.row) });
+			impl.add(equal);
+			auto *old = impl.allocate(spv::OpLoad, scalar_type);
+			old->add_id(capture.variable_id);
+			impl.add(old);
+			auto *select = impl.allocate(spv::OpSelect, scalar_type);
+			select->add_ids({ equal->id, value, old->id });
+			impl.add(select);
+			value = select->id;
+		}
+		auto *store = impl.allocate(spv::OpStore);
+		store->add_ids({ capture.variable_id, value });
+		impl.add(store);
+	}
+
 	// Need special handling for clip distance.
 	auto *clip_cull_meta = output_clip_cull_distance_meta(impl, output_element_index);
 	if (clip_cull_meta)
@@ -457,7 +504,7 @@ bool emit_store_output_instruction(Converter::Impl &impl, const llvm::CallInst *
 	if (num_cols > 1 || row_index || is_control_point_output)
 	{
 		Operation *op = impl.allocate(
-		    spv::OpAccessChain, builder.makePointer(spv::StorageClassOutput, builder.getScalarTypeId(output_type_id)));
+		    spv::OpAccessChain, builder.makePointer(builder.getStorageClass(var_id), builder.getScalarTypeId(output_type_id)));
 		ptr_id = op->id;
 
 		op->add_id(var_id);
@@ -502,6 +549,49 @@ bool emit_store_output_instruction(Converter::Impl &impl, const llvm::CallInst *
 
 	impl.register_externally_visible_write(instruction->getOperand(4));
 	spv::Id store_value = impl.get_id_for_value(instruction->getOperand(4));
+
+	if (impl.options.helios_tir_single_sample_output && meta.semantic == DXIL::Semantic::Coverage)
+	{
+		// D3D oMask bit 0 controls the one color sample. Vulkan oMask controls
+		// raster samples before native MERGE coverage reduction, so broadcast it.
+		auto *bit = impl.allocate(spv::OpBitwiseAnd, builder.makeUintType(32));
+		bit->add_ids({store_value, builder.makeUintConstant(1)});
+		impl.add(bit);
+		auto *mask = impl.allocate(spv::OpISub, builder.makeUintType(32));
+		mask->add_ids({builder.makeUintConstant(0), bit->id});
+		impl.add(mask);
+		store_value = mask->id;
+	}
+
+	if (impl.helios_tir_alpha_mask_id && meta.semantic == DXIL::Semantic::Target &&
+	    meta.semantic_offset == 0 && column == 3)
+	{
+		// D3D permits a monotonic one-step alpha mask. Use a fixed half threshold;
+		// ordered comparison gives NaN no coverage and preserves both endpoints.
+		auto alpha = store_value;
+		auto source_type = impl.get_type_id(instruction->getOperand(4)->getType());
+		if (source_type != builder.makeFloatType(32))
+		{
+			auto opcode = builder.isFloatType(source_type) ? spv::OpFConvert :
+			              meta.component_type == DXIL::ComponentType::I32 ? spv::OpConvertSToF : spv::OpConvertUToF;
+			auto *convert = impl.allocate(opcode, builder.makeFloatType(32));
+			convert->add_id(alpha);
+			impl.add(convert);
+			alpha = convert->id;
+		}
+		auto *enabled = impl.allocate(spv::OpFOrdGreaterThanEqual, builder.makeBoolType());
+		enabled->add_ids({alpha, builder.makeFloatConstant(0.5f)});
+		impl.add(enabled);
+		auto *mask = impl.allocate(spv::OpSelect, builder.makeUintType(32));
+		mask->add_ids({enabled->id, builder.makeUintConstant(~0u), builder.makeUintConstant(0)});
+		impl.add(mask);
+		auto *ptr = impl.allocate(spv::OpAccessChain, builder.makePointer(spv::StorageClassOutput, builder.makeUintType(32)));
+		ptr->add_ids({impl.helios_tir_alpha_mask_id, builder.makeUintConstant(0)});
+		impl.add(ptr);
+		auto *write = impl.allocate(spv::OpStore);
+		write->add_ids({ptr->id, mask->id});
+		impl.add(write);
+	}
 
 	if (impl.options.multiview.enable && impl.options.multiview.last_pre_rasterization_stage)
 	{

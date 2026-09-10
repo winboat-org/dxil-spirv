@@ -639,6 +639,7 @@ enum class AddressSpace : uint8_t
 {
 	Thread = 0,
 	GroupShared = 3,
+	ImmediateConstantBuffer = 5,
 	PhysicalNodeIO = 6,
 	Invalid
 };

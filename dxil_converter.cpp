@@ -3875,26 +3875,32 @@ static inline float half_to_float(uint16_t u16_value)
 	return u.f32;
 }
 
-spv::Id Converter::Impl::get_padded_constant_array(spv::Id padded_type_id, const llvm::Constant *constant)
+spv::Id Converter::Impl::get_constant_array(spv::Id type_id, const llvm::Constant *constant,
+                                           bool padded, bool raw_float)
 {
 	auto &builder = spirv_module.get_builder();
 	assert(constant->getType()->getTypeID() == llvm::Type::TypeID::ArrayTyID);
 	Vector<spv::Id> constituents;
+	auto element_type_id = builder.getContainedTypeId(type_id);
+	auto element_id = [&](const llvm::Constant *c) -> spv::Id {
+		if (const auto *undef = llvm::dyn_cast<llvm::UndefValue>(c))
+			return raw_float ? builder.makeNullConstant(element_type_id) : get_id_for_undef_constant(undef);
+		else if (raw_float)
+			return builder.makeUintConstant(llvm::cast<llvm::ConstantFP>(c)->getValueAPF().bitcastToAPInt().getZExtValue());
+		else
+			return get_id_for_constant(c, 0);
+	};
 
 	if (llvm::isa<llvm::ConstantAggregateZero>(constant))
 	{
-		return builder.makeNullConstant(padded_type_id);
+		return builder.makeNullConstant(type_id);
 	}
 	else if (auto *agg = llvm::dyn_cast<llvm::ConstantAggregate>(constant))
 	{
 		constituents.reserve(agg->getNumOperands() + 1);
 		for (unsigned i = 0; i < agg->getNumOperands(); i++)
 		{
-			llvm::Constant *c = agg->getOperand(i);
-			if (const auto *undef = llvm::dyn_cast<llvm::UndefValue>(c))
-				constituents.push_back(get_id_for_undef_constant(undef));
-			else
-				constituents.push_back(get_id_for_constant(c, 0));
+			constituents.push_back(element_id(agg->getOperand(i)));
 		}
 	}
 	else if (auto *array = llvm::dyn_cast<llvm::ConstantDataArray>(constant))
@@ -3902,18 +3908,15 @@ spv::Id Converter::Impl::get_padded_constant_array(spv::Id padded_type_id, const
 		constituents.reserve(array->getType()->getArrayNumElements() + 1);
 		for (unsigned i = 0; i < array->getNumElements(); i++)
 		{
-			llvm::Constant *c = array->getElementAsConstant(i);
-			if (const auto *undef = llvm::dyn_cast<llvm::UndefValue>(c))
-				constituents.push_back(get_id_for_undef_constant(undef));
-			else
-				constituents.push_back(get_id_for_constant(c, 0));
+			constituents.push_back(element_id(array->getElementAsConstant(i)));
 		}
 	}
 	else
 		return 0;
 
-	constituents.push_back(builder.makeNullConstant(get_type_id(constant->getType()->getArrayElementType())));
-	return builder.makeCompositeConstant(padded_type_id, constituents);
+	if (padded)
+		constituents.push_back(builder.makeNullConstant(element_type_id));
+	return builder.makeCompositeConstant(type_id, constituents);
 }
 
 spv::Id Converter::Impl::get_id_for_constant(const llvm::Constant *constant, unsigned forced_width)
@@ -4815,6 +4818,8 @@ static void build_geometry_stream_row_offsets(unsigned offsets[4], const llvm::M
 			offsets[row] += row_count_for_geometry_stream[i];
 }
 
+static bool entry_point_modifies_sample_mask(const llvm::MDNode *node);
+
 bool Converter::Impl::emit_stage_output_variables()
 {
 	auto *node = entry_point_meta;
@@ -4833,6 +4838,15 @@ bool Converter::Impl::emit_stage_output_variables()
 
 	unsigned clip_distance_count = 0;
 	unsigned cull_distance_count = 0;
+	if (execution_model == spv::ExecutionModelFragment && options.helios_tir_alpha_to_coverage &&
+	    !entry_point_modifies_sample_mask(entry_point_meta))
+	{
+		// Alpha-to-coverage addresses the single color sample, independent of
+		// raster coverage. An explicit SV_Coverage output disables A2C in D3D.
+		auto type = builder.makeArrayType(builder.makeUintType(32), builder.makeUintConstant(1), 0);
+		helios_tir_alpha_mask_id = create_variable(spv::StorageClassOutput, type, "tir_alpha_mask");
+		emit_builtin_decoration(helios_tir_alpha_mask_id, DXIL::Semantic::Coverage, spv::StorageClassOutput);
+	}
 	bool auto_patch_location = patch_location_offset == ~0u &&
 	                           (execution_model == spv::ExecutionModelTessellationControl ||
 	                            execution_model == spv::ExecutionModelMeshEXT);
@@ -4844,6 +4858,24 @@ bool Converter::Impl::emit_stage_output_variables()
 	unsigned start_row_for_geometry_stream[4] = {};
 	if (execution_model == spv::ExecutionModelGeometry)
 		build_geometry_stream_row_offsets(start_row_for_geometry_stream, outputs_node);
+
+	// Scalar XFB destinations are separate from raster outputs. Packed values,
+	// partial masks and repeated declarations therefore preserve rasterization.
+	// Assign disjoint locations; the Vulkan pipeline still enforces the device's
+	// output-interface limits rather than silently aliasing a raster output.
+	unsigned xfb_location = 0;
+	unsigned original_output_components = 0;
+	for (unsigned i = 0; i < outputs_node->getNumOperands(); i++)
+	{
+		auto *output = llvm::cast<llvm::MDNode>(outputs_node->getOperand(i));
+		unsigned stream = execution_model == spv::ExecutionModelGeometry ? get_geometry_shader_stream_index(output) : 0;
+		unsigned end = get_constant_metadata(output, 8) + get_constant_metadata(output, 6);
+		original_output_components += get_constant_metadata(output, 6) * get_constant_metadata(output, 7);
+		if (stream < 4)
+			end += start_row_for_geometry_stream[stream];
+		xfb_location = std::max(xfb_location, end);
+	}
+	unsigned xfb_component = 0;
 
 	for (unsigned i = 0; i < outputs_node->getNumOperands(); i++)
 	{
@@ -4865,6 +4897,164 @@ bool Converter::Impl::emit_stage_output_variables()
 		auto start_row = get_constant_metadata(output, 8);
 		auto start_col = get_constant_metadata(output, 9);
 		bool masked_output = false;
+
+		// Reuse an original complete variable when its capture is contiguous and
+		// unique. This costs no additional interface locations/components and is
+		// necessary for shaders already using the full output-register budget.
+		VulkanStreamOutput complete_capture = {};
+		bool complete = resource_mapping_iface && rows && cols &&
+			(actual_element_type == DXIL::ComponentType::F32 || actual_element_type == DXIL::ComponentType::I32 ||
+			 actual_element_type == DXIL::ComponentType::U32) &&
+			system_value != DXIL::Semantic::ClipDistance && system_value != DXIL::Semantic::CullDistance &&
+			(execution_model == spv::ExecutionModelVertex || execution_model == spv::ExecutionModelGeometry ||
+			 execution_model == spv::ExecutionModelTessellationEvaluation);
+		if (complete)
+		{
+			unsigned stream = execution_model == spv::ExecutionModelGeometry ? get_geometry_shader_stream_index(output) : 0;
+			for (unsigned row = 0; complete && row < rows; row++)
+			{
+				unsigned index = semantic_index + row;
+				if (output->getOperand(4))
+				{
+					auto *indices = llvm::cast<llvm::MDNode>(output->getOperand(4));
+					if (row < indices->getNumOperands()) index = get_constant_metadata(indices, row);
+				}
+				for (unsigned col = 0; complete && col < cols; col++)
+				{
+					D3DStreamOutputComponent component = { semantic_name.c_str(), index, start_row + row,
+						start_col + col, col, stream, 0 };
+					VulkanStreamOutput destination = {}, duplicate = {};
+					if (!resource_mapping_iface->remap_stream_output_component(component, destination)) return false;
+					component.capture_index = 1;
+					if (!resource_mapping_iface->remap_stream_output_component(component, duplicate)) return false;
+					if (!row && !col) complete_capture = destination;
+					complete = destination.enable && !duplicate.enable &&
+						destination.offset == complete_capture.offset + 4 * (row * cols + col) &&
+						destination.stride == complete_capture.stride && destination.buffer_index == complete_capture.buffer_index;
+				}
+			}
+		}
+		complete_capture.enable = complete;
+
+		bool scalarized = false;
+		VulkanStageIO scalar_io = { start_row, start_col };
+		if (!complete && resource_mapping_iface && system_value == DXIL::Semantic::User &&
+		    (actual_element_type == DXIL::ComponentType::F32 || actual_element_type == DXIL::ComponentType::I32 ||
+		     actual_element_type == DXIL::ComponentType::U32) &&
+		    (execution_model == spv::ExecutionModelVertex || execution_model == spv::ExecutionModelGeometry ||
+		     execution_model == spv::ExecutionModelTessellationEvaluation))
+		{
+			unsigned stream = execution_model == spv::ExecutionModelGeometry ? get_geometry_shader_stream_index(output) : 0;
+			for (unsigned row = 0; !scalarized && row < rows; row++)
+			{
+				unsigned index = semantic_index + row;
+				if (output->getOperand(4))
+				{
+					auto *indices = llvm::cast<llvm::MDNode>(output->getOperand(4));
+					if (row < indices->getNumOperands()) index = get_constant_metadata(indices, row);
+				}
+				for (unsigned col = 0; !scalarized && col < cols; col++)
+				{
+					VulkanStreamOutput destination = {};
+					D3DStreamOutputComponent component = { semantic_name.c_str(), index, start_row + row,
+						start_col + col, col, stream, 0 };
+					if (!resource_mapping_iface->remap_stream_output_component(component, destination)) return false;
+					scalarized = destination.enable;
+				}
+			}
+			if (scalarized)
+			{
+				if (execution_model == spv::ExecutionModelGeometry && stream < 4)
+					scalar_io.location += start_row_for_geometry_stream[stream];
+				D3DStageIO output_io = { semantic_name.c_str(), semantic_index, start_row, rows };
+				if (!resource_mapping_iface->remap_stage_output(output_io, scalar_io)) return false;
+			}
+		}
+
+		if (!complete && resource_mapping_iface && (execution_model == spv::ExecutionModelVertex ||
+		    execution_model == spv::ExecutionModelGeometry || execution_model == spv::ExecutionModelTessellationEvaluation))
+		{
+			unsigned stream = execution_model == spv::ExecutionModelGeometry ? get_geometry_shader_stream_index(output) : 0;
+			for (unsigned row = 0; row < rows; row++)
+			{
+				unsigned index = semantic_index + row;
+				if (output->getOperand(4))
+				{
+					auto *indices = llvm::cast<llvm::MDNode>(output->getOperand(4));
+					if (row < indices->getNumOperands())
+						index = get_constant_metadata(indices, row);
+				}
+				for (unsigned col = 0; col < cols; col++)
+				{
+					for (unsigned capture = 0; ; capture++)
+					{
+						VulkanStreamOutput destination = {};
+						D3DStreamOutputComponent component = { semantic_name.c_str(), index,
+							start_row + row, start_col + col, col, stream, capture };
+						if (!resource_mapping_iface->remap_stream_output_component(component, destination))
+							return false;
+						const bool raster_component = scalarized && capture == 0;
+						if (!destination.enable && !raster_component)
+							break;
+						if (capture >= 128 || destination.buffer_index >= 4 ||
+						    destination.offset > 508 || destination.stride > 2048 ||
+						    (destination.offset & 3) || (destination.stride & 3))
+						{
+							LOGE("Invalid stream-output component mapping.\n");
+							return false;
+						}
+						unsigned component_count = original_output_components + xfb_component + 1;
+						if (!raster_component && ((destination.max_output_components &&
+						     (component_count > destination.max_output_components ||
+						      xfb_location + xfb_component / 4 >= destination.max_output_components / 4)) ||
+						    (destination.max_total_output_components && execution_mode_meta.stage_output_num_vertex &&
+						     component_count > destination.max_total_output_components / execution_mode_meta.stage_output_num_vertex)))
+						{
+							LOGE("Partial/repeated stream-output capture exceeds Vulkan shader output-interface limits.\n");
+							return false;
+						}
+						// D3D stream output stores 32-bit components. The source DXIL
+						// store value carries the full value before min-precision IO lowering.
+						auto capture_type = actual_element_type;
+						if (capture_type == DXIL::ComponentType::F16) capture_type = DXIL::ComponentType::F32;
+						if (capture_type == DXIL::ComponentType::I16) capture_type = DXIL::ComponentType::I32;
+						if (capture_type == DXIL::ComponentType::U16) capture_type = DXIL::ComponentType::U32;
+						if (capture_type != DXIL::ComponentType::F32 && capture_type != DXIL::ComponentType::I32 &&
+						    capture_type != DXIL::ComponentType::U32)
+						{
+							LOGE("Stream output requires 32-bit scalar components.\n");
+							return false;
+						}
+						auto variable = create_variable(spv::StorageClassOutput, get_type_id(capture_type, 1, 1));
+						if (destination.enable)
+						{
+							builder.addCapability(spv::CapabilityTransformFeedback);
+							builder.addExecutionMode(spirv_module.get_entry_function(), spv::ExecutionModeXfb);
+							builder.addDecoration(variable, spv::DecorationOffset, destination.offset);
+							builder.addDecoration(variable, spv::DecorationXfbStride, destination.stride);
+							builder.addDecoration(variable, spv::DecorationXfbBuffer, destination.buffer_index);
+						}
+						if (raster_component)
+						{
+							builder.addDecoration(variable, spv::DecorationLocation, scalar_io.location + row);
+							builder.addDecoration(variable, spv::DecorationComponent, scalar_io.component + col);
+							emit_interpolation_decorations(variable, interpolation);
+						}
+						else
+						{
+							builder.addDecoration(variable, spv::DecorationLocation, xfb_location + xfb_component / 4);
+							builder.addDecoration(variable, spv::DecorationComponent, xfb_component++ % 4);
+						}
+						if (stream)
+						{
+							builder.addCapability(spv::CapabilityGeometryStreams);
+							builder.addDecoration(variable, spv::DecorationStream, stream);
+						}
+						stream_output_captures.push_back({ element_id, row, col, variable });
+					}
+				}
+			}
+		}
 
 		if (options.dual_source_blending && start_row >= 2)
 		{
@@ -4938,8 +5128,12 @@ bool Converter::Impl::emit_stage_output_variables()
 		}
 
 		spv::Id variable_id = create_variable(
-			masked_output ? spv::StorageClassPrivate : spv::StorageClassOutput, type_id, variable_name.c_str());
+			(masked_output || scalarized) ? spv::StorageClassPrivate : spv::StorageClassOutput, type_id, variable_name.c_str());
 		output_elements_meta[element_id] = { variable_id, actual_element_type, 0, system_value };
+		// The scalar variables already carry raster linkage and selected XFB
+		// decorations. Keep DXIL's vector/array storage private for StoreOutput.
+		if (scalarized)
+			continue;
 
 		if (effective_element_type != actual_element_type && component_type_is_16bit(actual_element_type))
 			builder.addDecoration(variable_id, spv::DecorationRelaxedPrecision);
@@ -4949,8 +5143,9 @@ bool Converter::Impl::emit_stage_output_variables()
 		{
 			if (resource_mapping_iface)
 			{
-				VulkanStreamOutput vk_output = {};
-				if (!resource_mapping_iface->remap_stream_output({ semantic_name.c_str(), semantic_index }, vk_output))
+				VulkanStreamOutput vk_output = complete_capture;
+				if (!vk_output.enable && !resource_mapping_iface->remap_stream_output(
+				    { semantic_name.c_str(), semantic_index }, vk_output))
 					return false;
 
 				if (vk_output.enable)
@@ -5453,6 +5648,52 @@ bool Converter::Impl::emit_hit_attribute()
 	return true;
 }
 
+bool Converter::Impl::is_robust_constant_lut(const llvm::Value *value) const
+{
+	if (!llvm::isa<llvm::ArrayType>(value->getType()->getPointerElementType()))
+		return false;
+	// Array pointer bitcasts and a zero-index GEP preserve the whole LUT. Do not
+	// lose its bounds when one of these aliases is used as the access-chain base.
+	for (;;)
+	{
+		const llvm::Value *base = nullptr;
+		if (auto *cast = llvm::dyn_cast<llvm::CastInst>(value))
+		{
+			if (cast->getOpcode() == llvm::Instruction::BitCast)
+				base = cast->getOperand(0);
+		}
+		else if (auto *gep = llvm::dyn_cast<llvm::GetElementPtrInst>(value))
+		{
+			if (gep->getNumOperands() == 2 && llvm::isa<llvm::ConstantInt>(gep->getOperand(1)) &&
+			    llvm::cast<llvm::ConstantInt>(gep->getOperand(1))->getUniqueInteger().getZExtValue() == 0)
+				base = gep->getOperand(0);
+		}
+		else if (auto *cexpr = llvm::dyn_cast<llvm::ConstantExpr>(value))
+		{
+			if (cexpr->getOpcode() == llvm::Instruction::BitCast ||
+			    (cexpr->getOpcode() == llvm::Instruction::GetElementPtr && cexpr->getNumOperands() == 2 &&
+			     cexpr->getOperand(1)->getUniqueInteger().getZExtValue() == 0))
+				base = cexpr->getOperand(0);
+		}
+		if (!base)
+			break;
+		if (!llvm::isa<llvm::ArrayType>(base->getType()->getPointerElementType()) ||
+		    base->getType()->getPointerElementType()->getArrayNumElements() !=
+		    value->getType()->getPointerElementType()->getArrayNumElements())
+			return false;
+		value = base;
+	}
+	auto *global = llvm::dyn_cast<llvm::GlobalVariable>(value);
+	if (!global || !global->isConstant() || !global->hasInitializer() ||
+	    !llvm::isa<llvm::ArrayType>(global->getType()->getPointerElementType()))
+		return false;
+	auto address_space = DXIL::AddressSpace(global->getType()->getAddressSpace());
+	// The native DXBC converter uses AS5 for immediate constant buffers. These
+	// have mandatory zero OOB reads, independently of optional HLSL LUT robustness.
+	return address_space == DXIL::AddressSpace::ImmediateConstantBuffer ||
+	       (address_space == DXIL::AddressSpace::Thread && options.extended_robustness.constant_lut);
+}
+
 bool Converter::Impl::emit_global_variables()
 {
 	auto &module = bitcode_parser.get_module();
@@ -5489,18 +5730,25 @@ bool Converter::Impl::emit_global_variables()
 		spv::Id scalar_type_id = 0;
 		bool padded_composite = false;
 		bool complex_composite = false;
+		bool raw_float_array = false;
+		auto *array_type = llvm::dyn_cast<llvm::ArrayType>(global.getType()->getPointerElementType());
 
-		if (address_space == DXIL::AddressSpace::Thread &&
-		    options.extended_robustness.constant_lut &&
-		    global.hasInitializer() &&
-		    global.isConstant())
+		// DXBC immediate buffers arrive from the native runtime as float arrays even
+		// when all accesses are integer bitcasts. Keep their float32 words in integer
+		// storage so SPIR-V float constant folding cannot quiet signaling NaNs.
+		// Existing pointer remapping restores the LLVM type at scalar loads/stores.
+		if (address_space == DXIL::AddressSpace::ImmediateConstantBuffer &&
+		    global.hasInitializer() && global.isConstant() && array_type)
+			raw_float_array = array_type->getArrayElementType()->getTypeID() == llvm::Type::TypeID::FloatTyID;
+
+		if (is_robust_constant_lut(&global) || raw_float_array)
 		{
-			if (auto *array_type = llvm::dyn_cast<llvm::ArrayType>(global.getType()->getPointerElementType()))
+			if (array_type)
 			{
-				scalar_type_id = get_type_id(array_type->getArrayElementType());
+				scalar_type_id = raw_float_array ? builder().makeUintType(32) : get_type_id(array_type->getArrayElementType());
+				padded_composite = is_robust_constant_lut(&global);
 				pointee_type_id = builder().makeArrayType(
-					scalar_type_id, builder().makeUintConstant(array_type->getArrayNumElements() + 1), false);
-				padded_composite = true;
+					scalar_type_id, builder().makeUintConstant(array_type->getArrayNumElements() + unsigned(padded_composite)), false);
 			}
 		}
 		else if (address_space == DXIL::AddressSpace::GroupShared &&
@@ -5561,20 +5809,24 @@ bool Converter::Impl::emit_global_variables()
 				}
 				initializer_id = builder().makeNullConstant(pointee_type_id);
 			}
-			else if (padded_composite)
-				initializer_id = get_padded_constant_array(pointee_type_id, initializer);
+			else if (padded_composite || raw_float_array)
+				initializer_id = get_constant_array(pointee_type_id, initializer, padded_composite, raw_float_array);
 			else
 				initializer_id = get_id_for_constant(initializer, 0);
 		}
 
 		spv::StorageClass storage_class = address_space == DXIL::AddressSpace::GroupShared
 		                                  ? spv::StorageClassWorkgroup : spv::StorageClassPrivate;
+		storage_class = get_effective_storage_class(&global, storage_class);
 		spv::Id var_id = create_variable_with_initializer(
-			get_effective_storage_class(&global, storage_class),
+			storage_class,
 			pointee_type_id, initializer_id);
 
 		decorate_relaxed_precision(global.getType()->getPointerElementType(), var_id, false);
 		rewrite_value(&global, var_id);
+		handle_to_storage_class[&global] = storage_class;
+		if (raw_float_array)
+			llvm_value_actual_type[&global] = scalar_type_id;
 	}
 
 	return true;
@@ -6964,7 +7216,11 @@ bool Converter::Impl::emit_execution_modes_pixel()
 {
 	auto &builder = spirv_module.get_builder();
 	auto flags = get_shader_flags(entry_point_meta);
-	bool early_depth_stencil = (flags & DXIL::ShaderFlagEarlyDepthStencil) != 0;
+	// TIR has no depth/stencil tests or sample-frequency shading. The engine
+	// gates this option on maintenance5's guaranteed early query ordering and
+	// normalizes the duplicated output samples in each physical query fragment.
+	bool early_depth_stencil = (flags & DXIL::ShaderFlagEarlyDepthStencil) != 0 ||
+	                          options.helios_forced_sample_count_one || options.helios_tir_single_sample_output;
 
 	if (options.descriptor_qa_enabled || options.instruction_instrumentation.enabled)
 	{
@@ -9368,6 +9624,15 @@ void Converter::Impl::set_option(const OptionBase &cap)
 		options.rasterizer_sample_count_spec_constant = count.spec_constant;
 		break;
 	}
+
+	case Option::HeliosForcedSampleCountOne:
+		options.helios_forced_sample_count_one = true;
+		break;
+
+	case Option::HeliosTIRSingleSampleOutput:
+		options.helios_tir_single_sample_output = true;
+		options.helios_tir_alpha_to_coverage = static_cast<const OptionHeliosTIRSingleSampleOutput &>(cap).alpha_to_coverage;
+		break;
 
 	case Option::RootConstantInlineUniformBlock:
 	{

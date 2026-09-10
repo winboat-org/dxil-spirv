@@ -194,12 +194,27 @@ struct D3DStreamOutput
 	unsigned semantic_index;
 };
 
+// One scalar output component, including physical DDI coordinates. capture_index
+// enumerates repeated captures of the same component into different destinations.
+struct D3DStreamOutputComponent
+{
+	const char *semantic;
+	unsigned semantic_index;
+	unsigned register_index;
+	unsigned component_index;
+	unsigned semantic_component;
+	unsigned stream_index;
+	unsigned capture_index;
+};
+
 struct VulkanStreamOutput
 {
 	unsigned offset;
 	unsigned stride;
 	unsigned buffer_index;
 	bool enable;
+	unsigned max_output_components;
+	unsigned max_total_output_components;
 };
 
 class ResourceRemappingInterface
@@ -212,6 +227,11 @@ public:
 	virtual bool remap_cbv(const D3DBinding &d3d_binding, VulkanCBVBinding &vulkan_binding) = 0;
 	virtual bool remap_vertex_input(const D3DStageIO &d3d_input, VulkanStageIO &vulkan_location) = 0;
 	virtual bool remap_stream_output(const D3DStreamOutput &d3d_output, VulkanStreamOutput &vulkan_output) = 0;
+	virtual bool remap_stream_output_component(const D3DStreamOutputComponent &, VulkanStreamOutput &output)
+	{
+		output.enable = false;
+		return true;
+	}
 	virtual bool remap_stage_input(const D3DStageIO &d3d_input, VulkanStageIO &vk_input) = 0;
 	virtual bool remap_stage_output(const D3DStageIO &d3d_output, VulkanStageIO &vk_output) = 0;
 	virtual unsigned get_root_constant_word_count() = 0;
@@ -276,6 +296,8 @@ enum class Option : uint32_t
 	SSBOAddressingBehavior = 52,
 	OpacityMicromap = 53,
 	FloatControls2 = 54,
+	HeliosForcedSampleCountOne = 55,
+	HeliosTIRSingleSampleOutput = 56,
 	Count
 };
 
@@ -334,6 +356,23 @@ struct OptionRasterizerSampleCount : OptionBase
 	}
 	unsigned count = 0;
 	bool spec_constant = false;
+};
+
+struct OptionHeliosForcedSampleCountOne : OptionBase
+{
+	OptionHeliosForcedSampleCountOne()
+	    : OptionBase(Option::HeliosForcedSampleCountOne)
+	{
+	}
+};
+
+struct OptionHeliosTIRSingleSampleOutput : OptionBase
+{
+	OptionHeliosTIRSingleSampleOutput()
+	    : OptionBase(Option::HeliosTIRSingleSampleOutput)
+	{
+	}
+	bool alpha_to_coverage = false;
 };
 
 struct OptionRootConstantInlineUniformBlock : OptionBase

@@ -116,6 +116,17 @@ typedef struct dxil_spv_d3d_stream_output
 	unsigned semantic_index;
 } dxil_spv_d3d_stream_output;
 
+typedef struct dxil_spv_d3d_stream_output_component
+{
+	const char *semantic;
+	unsigned semantic_index;
+	unsigned register_index;
+	unsigned component_index;
+	unsigned semantic_component;
+	unsigned stream_index;
+	unsigned capture_index;
+} dxil_spv_d3d_stream_output_component;
+
 typedef struct dxil_spv_vulkan_stream_output
 {
 	unsigned offset;
@@ -126,6 +137,20 @@ typedef struct dxil_spv_vulkan_stream_output
 
 typedef dxil_spv_bool (*dxil_spv_stream_output_remapper_cb)(void *userdata, const dxil_spv_d3d_stream_output *d3d_output,
                                                             dxil_spv_vulkan_stream_output *vulkan_output);
+
+typedef struct dxil_spv_vulkan_stream_output_component
+{
+	unsigned offset;
+	unsigned stride;
+	unsigned buffer_index;
+	dxil_spv_bool enable;
+	unsigned max_output_components;
+	unsigned max_total_output_components;
+} dxil_spv_vulkan_stream_output_component;
+
+typedef dxil_spv_bool (*dxil_spv_stream_output_component_remapper_cb)(void *userdata,
+        const dxil_spv_d3d_stream_output_component *d3d_output,
+        dxil_spv_vulkan_stream_output_component *vulkan_output);
 
 typedef struct dxil_spv_d3d_shader_stage_io
 {
@@ -495,6 +520,9 @@ typedef enum dxil_spv_option
 	DXIL_SPV_OPTION_SSBO_ADDRESSING_BEHAVIOR = 52,
 	DXIL_SPV_OPTION_OPACITY_MICROMAP = 53,
 	DXIL_SPV_OPTION_FLOAT_CONTROLS_2 = 54,
+	/* Private static-engine option; no application-facing ABI. */
+	DXIL_SPV_OPTION_HELIOS_FORCED_SAMPLE_COUNT_ONE = 55,
+	DXIL_SPV_OPTION_HELIOS_TIR_SINGLE_SAMPLE_OUTPUT = 56,
 	DXIL_SPV_OPTION_INT_MAX = 0x7fffffff
 } dxil_spv_option;
 
@@ -552,6 +580,12 @@ typedef struct dxil_spv_option_rasterizer_sample_count
 	unsigned sample_count;
 	dxil_spv_bool spec_constant;
 } dxil_spv_option_rasterizer_sample_count;
+
+typedef struct dxil_spv_option_helios_tir_single_sample_output
+{
+	dxil_spv_option_base base;
+	dxil_spv_bool alpha_to_coverage;
+} dxil_spv_option_helios_tir_single_sample_output;
 
 typedef struct dxil_spv_option_root_constant_inline_uniform_block
 {
@@ -988,6 +1022,11 @@ DXIL_SPV_PUBLIC_API void dxil_spv_converter_set_vertex_input_remapper(
 DXIL_SPV_PUBLIC_API void dxil_spv_converter_set_stream_output_remapper(
 		dxil_spv_converter converter,
 		dxil_spv_stream_output_remapper_cb remapper,
+		void *userdata);
+
+DXIL_SPV_PUBLIC_API void dxil_spv_converter_set_stream_output_component_remapper(
+		dxil_spv_converter converter,
+		dxil_spv_stream_output_component_remapper_cb remapper,
 		void *userdata);
 
 DXIL_SPV_PUBLIC_API void dxil_spv_converter_set_srv_remapper(
